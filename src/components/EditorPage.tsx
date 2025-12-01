@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Play, RotateCcw, CheckCircle } from 'lucide-react';
 import { supabase, getSessionId } from '../lib/supabase';
 import { Challenge } from '../types';
@@ -17,6 +17,9 @@ export default function EditorPage({ initialChallenge }: EditorPageProps) {
   const [score, setScore] = useState(0);
   const [mistakes, setMistakes] = useState(0);
   const [runCount, setRunCount] = useState(0);
+  const [diagnostics, setDiagnostics] = useState<null | { message: string; line?: number; column?: number; stack?: string }>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const diagnosticsRef = useRef<null | { message: string; line?: number; column?: number; stack?: string }>(null);
 
   useEffect(() => {
     if (initialChallenge) {
@@ -27,6 +30,8 @@ export default function EditorPage({ initialChallenge }: EditorPageProps) {
       setScore(0);
       setMistakes(0);
       setRunCount(0);
+      setDiagnostics(null);
+      diagnosticsRef.current = null;
     }
   }, [initialChallenge]);
 
@@ -44,7 +49,51 @@ export default function EditorPage({ initialChallenge }: EditorPageProps) {
   const submitChallenge = async () => {
     if (!initialChallenge) return;
 
+    // Validate code before submitting: check JS syntax and any runtime diagnostics
     setSubmitting(true);
+    setDiagnostics(null);
+    diagnosticsRef.current = null;
+
+    // Quick JS syntax check
+    try {
+      // eslint-disable-next-line no-new-func
+      new Function(js);
+    } catch (err: any) {
+      const diag = { message: err.message || 'JavaScript syntax error' };
+      setDiagnostics(diag);
+      diagnosticsRef.current = diag;
+      setSubmitting(false);
+      return;
+    }
+
+    // Run the code to surface immediate errors (HTML/CSS/JS syntax). runCode
+    // now returns a boolean indicating immediate errors.
+    const hadImmediateErrors = runCode();
+    if (hadImmediateErrors) {
+      // immediate errors found (HTML/CSS/JS syntax)
+      setSubmitting(false);
+      return;
+    }
+
+    // Wait briefly for runtime diagnostics (from iframe) to appear
+    const waitForDiagnostics = (timeout = 2000) =>
+      new Promise<null | { message: string; line?: number; column?: number; stack?: string }>((resolve) => {
+        const start = Date.now();
+        const check = () => {
+          if (diagnosticsRef.current) return resolve(diagnosticsRef.current);
+          if (Date.now() - start > timeout) return resolve(null);
+          setTimeout(check, 50);
+        };
+        check();
+      });
+
+    const diag = await waitForDiagnostics(2000);
+    if (diag) {
+      setDiagnostics(diag);
+      setSubmitting(false);
+      return;
+    }
+
     const finalScore = calculateScore();
     try {
       const { error } = await supabase.from('user_progress').insert([
@@ -74,27 +123,96 @@ export default function EditorPage({ initialChallenge }: EditorPageProps) {
     }
   };
 
-  const runCode = () => {
-    setRunCount(runCount + 1);
+  const runCode = (): boolean => {
+    setDiagnostics(null);
+    diagnosticsRef.current = null;
+    setRunCount((c) => c + 1);
     let errorCount = 0;
 
     const htmlCode = html;
     const cssCode = `<style>${css}</style>`;
 
-    const hasHtmlErrors = html.includes('<script') && !html.includes('</script>');
-    const hasCssErrors = css.includes('{') && !css.includes('}');
+    const checkCssErrors = (cssText: string) => {
+      const open = (cssText.match(/{/g) || []).length;
+      const close = (cssText.match(/}/g) || []).length;
+      return open !== close;
+    };
+
+    const checkHtmlErrors = (htmlText: string) => {
+      // very small heuristic: basic tag stack matching ignoring void elements
+      const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr']);
+      const tagRe = /<\s*\/?\s*([a-zA-Z0-9-]+)([^>]*)>/g;
+      const stack: string[] = [];
+      let m: RegExpExecArray | null;
+      while ((m = tagRe.exec(htmlText)) !== null) {
+        const raw = m[0];
+        const name = m[1].toLowerCase();
+        const isClosing = raw.startsWith('</') || raw.endsWith('/>');
+        const selfClosing = /\/.+>$/.test(raw) || raw.endsWith('/>');
+        if (isClosing) {
+          if (stack.length === 0) return true;
+          const last = stack.pop();
+          if (last !== name) return true;
+        } else if (!selfClosing && !VOID.has(name)) {
+          stack.push(name);
+        }
+      }
+      return stack.length > 0;
+    };
+
+    const hasHtmlErrors = checkHtmlErrors(html);
+    const hasCssErrors = checkCssErrors(css);
 
     if (hasHtmlErrors || hasCssErrors) {
       errorCount++;
+      const diag = { message: hasHtmlErrors ? 'Possible HTML tag mismatch detected' : 'Possible CSS brace mismatch detected' };
+      setDiagnostics(diag);
+      diagnosticsRef.current = diag;
+    }
+
+    // Quick syntax check for JS
+    try {
+      // new Function will throw for syntax errors
+      // eslint-disable-next-line no-new-func
+      new Function(js);
+    } catch (err: any) {
+      const diag = { message: err.message || 'JavaScript syntax error' };
+      setDiagnostics(diag);
+      diagnosticsRef.current = diag;
+      setMistakes((m) => m + 1);
+      return true;
     }
 
     const jsCode = `<script>
-      try {
-        ${js}
-      } catch (error) {
-        console.error('Error:', error);
-        document.body.innerHTML += '<div style="color: red; padding: 10px; background: #fee; border: 1px solid red; margin: 10px;">Error: ' + error.message + '</div>';
-      }
+      (function(){
+        const origConsoleError = console.error;
+        console.error = function(...args) {
+          try { parent.postMessage({ type: 'playground_error', message: args.map(String).join(' '), stack: '' }, '*'); } catch (e) {}
+          origConsoleError.apply(console, args);
+        };
+        window.addEventListener('error', function(e) {
+          try {
+            const payload = { type: 'playground_error', message: e.message || String(e), stack: e.error && e.error.stack ? e.error.stack : (e.filename ? e.filename + ':' + e.lineno + ':' + e.colno : '') };
+            parent.postMessage(payload, '*');
+          } catch (ex) {
+            parent.postMessage({ type: 'playground_error', message: String(ex), stack: ''}, '*');
+          }
+        });
+        window.addEventListener('unhandledrejection', function(e) {
+          try {
+            const reason = e.reason || 'Unhandled rejection';
+            parent.postMessage({ type: 'playground_error', message: reason.message || String(reason), stack: reason.stack || '' }, '*');
+          } catch (ex) {
+            parent.postMessage({ type: 'playground_error', message: String(ex), stack: '' }, '*');
+          }
+        });
+        try {
+          ${js}
+        } catch (err) {
+          try { parent.postMessage({ type: 'playground_error', message: err.message || String(err), stack: err.stack || '' }, '*'); } catch (ex) { /* ignore */ }
+        }
+      })();
+      //# sourceURL=playground.js
     </script>`;
 
     const fullCode = `
@@ -114,9 +232,50 @@ export default function EditorPage({ initialChallenge }: EditorPageProps) {
 
     setOutput(fullCode);
     if (errorCount > 0) {
-      setMistakes(mistakes + errorCount);
+      setMistakes((m) => m + errorCount);
     }
+
+    return errorCount > 0;
   };
+
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      // Only accept messages from our iframe
+      if (iframeRef.current && e.source !== iframeRef.current.contentWindow) return;
+      const data = e.data || {};
+      if (data.type === 'playground_error') {
+        const stack: string = data.stack || '';
+        const message: string = data.message || 'Runtime error';
+        const m = /playground\.js:(\d+):(\d+)/.exec(stack);
+        if (m) {
+          const line = parseInt(m[1], 10);
+          const column = parseInt(m[2], 10);
+          const diag = { message, line, column, stack };
+          setDiagnostics(diag);
+          diagnosticsRef.current = diag;
+          setMistakes((m) => m + 1);
+          // scroll JS textarea to the error line
+          const textarea = document.querySelector('textarea[aria-label="js-editor"]') as HTMLTextAreaElement | null;
+          if (textarea && line > 0) {
+            const lines = textarea.value.split('\n');
+            let pos = 0;
+            for (let i = 0; i < Math.min(line - 1, lines.length); i++) pos += lines[i].length + 1;
+            textarea.focus();
+            textarea.selectionStart = pos;
+            textarea.selectionEnd = pos + (lines[line - 1] ? lines[line - 1].length : 0);
+          }
+        } else {
+          const diag = { message, stack };
+          setDiagnostics(diag);
+          diagnosticsRef.current = diag;
+          setMistakes((m) => m + 1);
+        }
+      }
+    };
+
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
 
   const resetCode = () => {
     if (initialChallenge) {
@@ -129,6 +288,8 @@ export default function EditorPage({ initialChallenge }: EditorPageProps) {
       setJs('// Write your JavaScript here\nconsole.log("Hello from JavaScript!");');
     }
     setOutput('');
+    setDiagnostics(null);
+    diagnosticsRef.current = null;
   };
 
   useEffect(() => {
@@ -210,6 +371,26 @@ export default function EditorPage({ initialChallenge }: EditorPageProps) {
         )}
       </div>
 
+      {diagnostics && (
+        <div className="mt-4 bg-red-50 border border-red-300 rounded-lg p-4">
+          <div className="flex items-start space-x-3">
+            <div className="text-red-600 font-semibold">Error</div>
+            <div className="text-sm text-red-700">
+              <div>{diagnostics.message}</div>
+              {typeof diagnostics.line === 'number' && (
+                <div>Line: {diagnostics.line}, Column: {diagnostics.column ?? '-'} </div>
+              )}
+              {diagnostics.stack && (
+                <details className="mt-2 text-xs text-red-600">
+                  <summary>Stack trace</summary>
+                  <pre className="whitespace-pre-wrap">{diagnostics.stack}</pre>
+                </details>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="grid lg:grid-cols-2 gap-4">
         <div className="space-y-4">
           <div className="bg-white rounded-lg shadow-md overflow-hidden">
@@ -244,6 +425,7 @@ export default function EditorPage({ initialChallenge }: EditorPageProps) {
               value={js}
               onChange={(e) => setJs(e.target.value)}
               className="w-full h-48 p-4 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-yellow-500 resize-none"
+              aria-label="js-editor"
               spellCheck={false}
             />
           </div>
@@ -256,6 +438,7 @@ export default function EditorPage({ initialChallenge }: EditorPageProps) {
           <div className="border-t border-gray-200" style={{ height: '600px' }}>
             {output ? (
               <iframe
+                ref={iframeRef}
                 srcDoc={output}
                 title="output"
                 sandbox="allow-scripts"
